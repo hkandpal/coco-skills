@@ -1,184 +1,76 @@
-Snowflake Error Handler Skill for Cortex Code (CoCo)
+---
+name: error-handler
+description: Set up and use a common error-logging framework for Snowflake Scripting stored procedures (BATCH_ERROR_LOG table + SNOW_ERROR_CAPTURE procedure). Use when: adding error handling to a SQL stored procedure, logging failures from ETL/batch jobs, capturing SQLCODE/SQLERRM/SQLSTATE into a table, converting Oracle-style exception handling to Snowflake, or debugging why a procedure's errors are not being logged. Triggers: error handler, error logging, error log table, BATCH_ERROR_LOG, SNOW_ERROR_CAPTURE, EXCEPTION WHEN OTHER, log procedure errors, capture SQLERRM, batch error log.
+---
 
-A custom skill that teaches Cortex Code to automatically wrap every new stored procedure in a standardized error-handling block, logging failures to a centralized telemetry table.
+# Snowflake Error Handler
 
+A reusable pattern for logging stored procedure failures to a central table.
+The setup script is `.cortex/skills/error-handler-setup.sql` in this skill directory.
 
+## Components
 
-Overview
+| Object | Type | Purpose |
+|---|---|---|
+| `BATCH_ERROR_LOG` | Table | Primary error log (date, batch id, job name, description, failing statement) |
+| `SNOW_ERROR_CAPTURE(p_batch_id, p_job_name, p_error_desc, p_err_stmt)` | Procedure | Central writer into `BATCH_ERROR_LOG`; defaults NULL inputs; returns `'SUCCESS'` or a JSON error object |
+| `ERROR_LOG` + `SEQ_ERR` | Table + Sequence | Legacy simple log, kept for backward compatibility |
+| `HK_TEST()` | Procedure | Example caller that forces a divide-by-zero and logs it |
 
-Scattered, unpredictable error logs are a nightmare to manage. This skill ensures that every time CoCo scaffolds a new Snowflake Stored Procedure, it includes a robust, uniform error-handling block that captures failures and logs them into a centralized BATCH\_ERROR\_LOG table.
+## Workflow
 
+1. **Confirm target location.** Ask the user for the database and schema; verify they exist and the current role can create objects there. Use fully qualified names.
+2. **Check for existing objects** before running setup:
+   ```sql
+   SHOW TABLES LIKE '%ERROR_LOG' IN SCHEMA <db>.<schema>;
+   ```
+   The script uses `CREATE OR REPLACE TABLE`, which **drops existing log rows**. If the tables already exist, switch to `CREATE TABLE IF NOT EXISTS` or get explicit user confirmation.
+3. **Run setup** (`error-handler-setup.sql`) once per environment.
+4. **Wire into procedures** using the pattern below.
+5. **Verify** with `CALL HK_TEST();` then
+   `SELECT * FROM BATCH_ERROR_LOG ORDER BY ERROR_DATE DESC LIMIT 10;`
 
+## Calling Pattern
 
-By pairing this skill with Snowflake's alerting mechanisms, you can automatically trigger email notifications on failure — and if you route those into an incident management tool like PagerDuty, your team gets real-time alerts the second a production data load fails.
+Track the current step in a variable so the log shows where the failure happened:
 
-
-
-What's Included
-
-File	Purpose
-
-.cortex/skills/error-handler-setup.sql	One-time environment setup: creates the error log table, sequence, and the central SNOW\_ERROR\_CAPTURE procedure
-
-.cortex/skills/SKILL.md	Skill definition that tells CoCo when and how to apply the error-handling pattern
-
-How It Works
-
-BATCH\_ERROR\_LOG table — Central telemetry table storing error date, batch ID, job name, description, and the failing SQL statement.
-
-SNOW\_ERROR\_CAPTURE procedure — A reusable procedure called from any other procedure's EXCEPTION block. It safely escapes dynamic SQL values and inserts a row into BATCH\_ERROR\_LOG.
-
-Automatic triggering — Once installed, CoCo automatically detects when you're building a stored procedure and wraps your logic in the standard error-handling pattern.
-
-Installation
-
-Option 1: Local (Personal Use)
-
-Place the .cortex/skills/ folder in your workspace directory. CoCo will detect and activate the skill automatically.
-
-
-
-Option 2: Git (Team Sharing)
-
-Clone or fork this repository and install it via the Agent Settings panel in Cortex Code Desktop under the Git skills section.
-
-
-
-Option 3: Snowflake Stage (Organization-wide)
-
-Upload the skill folder to a Snowflake Stage to share it across your entire data engineering team.
-
-
-
-One-Time Setup
-
-Run the setup SQL once per database where you want error logging:
-
-
-
-CREATE OR REPLACE SEQUENCE SEQ\_ERR;
-
-
-
-CREATE OR REPLACE TABLE BATCH\_ERROR\_LOG (
-
-&#x20;   ERROR\_DATE  TIMESTAMP\_NTZ  NOT NULL,
-
-&#x20;   BATCH\_ID    NUMBER(38,0)   NOT NULL,
-
-&#x20;   JOB\_NAME    VARCHAR(100)   NOT NULL,
-
-&#x20;   DESCRIPTION VARCHAR        NOT NULL,
-
-&#x20;   ERROR\_STMT  VARCHAR        NOT NULL
-
-);
-
-Then create the central error capture procedure (see error-handler-setup.sql for the full definition).
-
-
-
-Usage Example
-
-Once the skill is active, simply ask CoCo to create a procedure:
-
-
-
-"CoCo, please create a new procedure to process daily sales transactions."
-
-
-
-CoCo will automatically wrap your logic in the error-handling pattern:
-
-
-
-CREATE OR REPLACE PROCEDURE PROCESS\_DAILY\_SALES()
-
-RETURNS VARCHAR(200)
-
+```sql
+CREATE OR REPLACE PROCEDURE MY_JOB()
+RETURNS VARCHAR
 LANGUAGE SQL
-
 AS
-
 $$
-
 DECLARE
-
-&#x20;   v\_err\_stmt VARCHAR;
-
+    v_err_stmt VARCHAR;
 BEGIN
-
-&#x20;   v\_err\_stmt := 'Processing daily sales';
-
-
-
-&#x20;   -- Your business logic here
-
-&#x20;   INSERT INTO SALES\_SUMMARY
-
-&#x20;   SELECT region, SUM(amount)
-
-&#x20;   FROM RAW\_SALES
-
-&#x20;   WHERE sale\_date = CURRENT\_DATE
-
-&#x20;   GROUP BY region;
-
-
-
-&#x20;   RETURN 'SUCCESS';
-
-
-
+    v_err_stmt := 'Load stage table';
+    -- ... work ...
+    v_err_stmt := 'Merge into target';
+    -- ... work ...
+    RETURN 'SUCCESS';
 EXCEPTION
-
-&#x20;   WHEN OTHER THEN
-
-&#x20;       CALL SNOW\_ERROR\_CAPTURE(
-
-&#x20;           100,
-
-&#x20;           'PROCESS\_DAILY\_SALES',
-
-&#x20;           'SQLCODE: ' || :sqlcode || ' SQLERRM: ' || :sqlerrm || ' SQLSTATE: ' || :sqlstate,
-
-&#x20;           :v\_err\_stmt
-
-&#x20;       );
-
-&#x20;       RETURN 'FAILED';
-
+    WHEN OTHER THEN
+        CALL SNOW_ERROR_CAPTURE(
+            100,
+            'MY_JOB',
+            'SQLCODE: ' || :sqlcode || ' SQLERRM: ' || :sqlerrm || ' SQLSTATE: ' || :sqlstate,
+            :v_err_stmt
+        );
+        RAISE;  -- re-raise so callers/tasks see the failure
 END;
-
 $$;
+```
 
+## Rules and Pitfalls
 
-
-Prerequisites
-
-A Snowflake account with Cortex Code enabled
-
-Permissions to create tables, sequences, and procedures in your target schema
-
-Cortex Code Desktop, Snowsight, or CLI access
-
-Further Reading
-
-Mastering Snowflake's CoCo: How to Build Custom Skills for Error Handling — Original article by the author
-
-Snowflake Cortex Code Documentation
-
-Author
-
-Himanshu Kandpal (@hkandpal732)
-
-
-
-License
-
-Apache-2.0
-
-
-
-
-
+- **Reference variables with a colon** (`:v_err_stmt`) inside SQL statements in the procedure body; otherwise they are treated as column names.
+- **Re-raise after logging** (`RAISE;`) or return an explicit failure status. Swallowing the exception makes tasks report success on failed runs. The bundled `HK_TEST` example does not re-raise; do not copy that behavior into production jobs.
+- **Prefer bind variables over dynamic SQL.** `SNOW_ERROR_CAPTURE` builds its INSERT by string concatenation and only escapes `p_err_stmt`; quotes in `p_job_name`/`p_error_desc` can break it and allow SQL injection. Recommended replacement for the dynamic block:
+  ```sql
+  INSERT INTO BATCH_ERROR_LOG (ERROR_DATE, BATCH_ID, JOB_NAME, DESCRIPTION, ERROR_STMT)
+  VALUES (CURRENT_TIMESTAMP, :v_batch_id, :v_job_name, :v_error_desc, :v_err_stmt);
+  ```
+  With binds, the manual `REPLACE` escaping in both procedures is unnecessary.
+- `JOB_NAME` is `VARCHAR(100)`; longer names fail the insert. Truncate with `LEFT(:p_job_name, 100)` if needed.
+- `FROM DUAL` is valid in Snowflake; removing it is optional, not a bug fix.
+- Oracle `VARCHAR2` maps to `VARCHAR`.
